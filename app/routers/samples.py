@@ -15,10 +15,9 @@ async def list_samples(
     limit: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> list[SampleOut]:
-    """Returns all current (latest) sample records, paginated."""
+    """Returns all sample records, paginated, most recently modified first."""
     result = await db.execute(
         select(Sample)
-        .where(Sample.is_latest.is_(True))
         .order_by(Sample.last_modified.desc())
         .offset(skip)
         .limit(limit)
@@ -33,19 +32,16 @@ async def search_samples(
     limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ) -> list[SampleOut]:
-    """Full-text search across all clinical description fields via tsvector GIN index."""
-    result = await db.execute(
-        select(Sample)
-        .where(
-            Sample.is_latest.is_(True),
-            func.to_tsvector("spanish", func.coalesce(Sample.search_vector, "")).op("@@")(
-                func.plainto_tsquery("spanish", q)
-            ),
-        )
-        .offset(skip)
-        .limit(limit)
+    """
+    Full-text search across clinical description fields.
+    Queries sample_translations.search_vector (English).
+    Will be wired to translations table in Step 6.
+    """
+    # Placeholder until sample_translations is built in Step 6
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="Full-text search will be available after translation pipeline is complete.",
     )
-    return result.scalars().all()
 
 
 @router.get("/filter/query", response_model=list[SampleOut])
@@ -61,8 +57,8 @@ async def filter_samples(
     limit: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> list[SampleOut]:
-    """Filter latest records by demographic or clinical criteria."""
-    query = select(Sample).where(Sample.is_latest.is_(True))
+    """Filter records by demographic or clinical criteria."""
+    query = select(Sample)
 
     if gender:
         query = query.where(Sample.gender == gender.upper())
@@ -94,11 +90,10 @@ async def get_sample(
     anonymized_sample_id: str,
     db: AsyncSession = Depends(get_db),
 ) -> SampleOut:
-    """Returns the current (latest) version of a sample."""
+    """Returns the current record for a sample ID."""
     result = await db.execute(
         select(Sample).where(
-            Sample.anonymized_sample_id == anonymized_sample_id,
-            Sample.is_latest.is_(True),
+            Sample.anonymized_sample_id == anonymized_sample_id
         )
     )
     sample = result.scalar_one_or_none()
@@ -108,62 +103,3 @@ async def get_sample(
             detail=f"Sample '{anonymized_sample_id}' not found.",
         )
     return sample
-
-
-@router.get("/{anonymized_sample_id}/history", response_model=list[SampleOut])
-async def get_sample_history(
-    anonymized_sample_id: str,
-    db: AsyncSession = Depends(get_db),
-) -> list[SampleOut]:
-    """Returns all versions of a sample, oldest first."""
-    result = await db.execute(
-        select(Sample)
-        .where(Sample.anonymized_sample_id == anonymized_sample_id)
-        .order_by(Sample.version.asc())
-    )
-    rows = result.scalars().all()
-    if not rows:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Sample '{anonymized_sample_id}' not found.",
-        )
-    return rows
-
-
-@router.get("/{anonymized_sample_id}/diff")
-async def get_sample_diff(
-    anonymized_sample_id: str,
-    db: AsyncSession = Depends(get_db),
-) -> dict:
-    """Field-level diff between every consecutive version pair."""
-    result = await db.execute(
-        select(Sample)
-        .where(Sample.anonymized_sample_id == anonymized_sample_id)
-        .order_by(Sample.version.asc())
-    )
-    versions = result.scalars().all()
-    if len(versions) < 2:
-        return {"message": "Only one version exists — no diff available."}
-
-    skip_fields = {
-        "id", "version", "is_latest", "last_modified", "created_at",
-        "ingestion_log_id", "search_vector"
-    }
-    diffs = []
-    for prev, curr in zip(versions, versions[1:]):
-        changed = {}
-        for col in Sample.__table__.columns.keys():
-            if col in skip_fields:
-                continue
-            old_val = getattr(prev, col)
-            new_val = getattr(curr, col)
-            if old_val != new_val:
-                changed[col] = {"from": old_val, "to": new_val}
-        diffs.append({
-            "from_version": prev.version,
-            "to_version": curr.version,
-            "changed_at": curr.last_modified,
-            "fields_changed": changed,
-        })
-
-    return {"anonymized_sample_id": anonymized_sample_id, "diffs": diffs}

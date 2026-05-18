@@ -1,5 +1,4 @@
 import time
-from datetime import datetime, timezone
 from app.services.ingestion import now_utc
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
@@ -32,7 +31,8 @@ async def upload_data(
     """
     Accepts .xlsx, .xls, or .csv files.
     Validates structure, deduplicates by AnonymizedSampleID,
-    and persists new/changed records with full version history.
+    and persists records — overwriting in place on change.
+    Translation is queued as a background task after upload.
     """
     started_at = now_utc()
     start_ms = time.monotonic()
@@ -68,7 +68,7 @@ async def upload_data(
         logger.warning(f"Missing expected columns: {missing_expected_cols}")
 
     # ------------------------------------------------------------------ #
-    # 3. Check for duplicate file (Guard 1 — operational warning only)
+    # 3. Check for duplicate file (warning only — process anyway)
     # ------------------------------------------------------------------ #
     duplicate_file_warning = False
     existing_log = await db.execute(
@@ -90,10 +90,10 @@ async def upload_data(
         uploaded_at=started_at,
     )
     db.add(raw_file)
-    await db.flush()  # get raw_file.id without committing
+    await db.flush()
 
     # ------------------------------------------------------------------ #
-    # 5. Create ingestion log entry (status=processing while we work)
+    # 5. Create ingestion log entry
     # ------------------------------------------------------------------ #
     log_entry = IngestionLog(
         raw_file_id=raw_file.id,
@@ -104,10 +104,10 @@ async def upload_data(
         started_at=started_at,
     )
     db.add(log_entry)
-    await db.flush()  # get log_entry.id
+    await db.flush()
 
     # ------------------------------------------------------------------ #
-    # 6. Run ingestion (validate + dedup + classify rows)
+    # 6. Run ingestion
     # ------------------------------------------------------------------ #
     try:
         counts = await ingest_rows(
@@ -116,7 +116,6 @@ async def upload_data(
             ingestion_log_id=log_entry.id,
         )
     except Exception as exc:
-        # Rollback happens automatically via get_db context manager
         log_entry.status = "failed"
         log_entry.error_detail = str(exc)
         log_entry.completed_at = now_utc()
@@ -128,7 +127,7 @@ async def upload_data(
         )
 
     # ------------------------------------------------------------------ #
-    # 7. Update ingestion log and commit everything atomically
+    # 7. Update ingestion log and commit
     # ------------------------------------------------------------------ #
     processing_ms = int((time.monotonic() - start_ms) * 1000)
     status_str = "success" if counts["rejected"] == 0 else "partial"
@@ -136,7 +135,7 @@ async def upload_data(
     log_entry.status = status_str
     log_entry.rows_inserted = counts["inserted"]
     log_entry.rows_updated = counts["updated"]
-    log_entry.rows_versioned = counts["versioned"]
+    log_entry.rows_versioned = 0  # versioning removed
     log_entry.rows_rejected = counts["rejected"]
     log_entry.completed_at = now_utc()
     log_entry.processing_ms = processing_ms
@@ -146,17 +145,23 @@ async def upload_data(
     logger.info(
         f"Upload complete in {processing_ms}ms — "
         f"inserted={counts['inserted']} updated={counts['updated']} "
-        f"versioned={counts['versioned']} rejected={counts['rejected']}"
+        f"unchanged={counts['unchanged']} rejected={counts['rejected']}"
     )
+
+    # ------------------------------------------------------------------ #
+    # 8. Background translation task will be added in Step 4
+    # For now translation_status reflects queued intent
+    # ------------------------------------------------------------------ #
 
     return UploadSummary(
         file_name=file.filename or "unknown",
         rows_total=len(raw_rows),
         rows_inserted=counts["inserted"],
         rows_updated=counts["updated"],
-        rows_versioned=counts["versioned"],
+        rows_unchanged=counts["unchanged"],
         rows_rejected=counts["rejected"],
         ingestion_log_id=log_entry.id,
         duplicate_file_warning=duplicate_file_warning,
         missing_expected_columns=missing_expected_cols,
+        translation_status="queued",
     )

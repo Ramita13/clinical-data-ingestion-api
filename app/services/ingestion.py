@@ -1,16 +1,15 @@
 """
-Ingestion service — the heart of the upload pipeline.
+Ingestion service.
 
 Flow per file:
   1. Validate all rows with Pydantic (collect valid + rejected)
-  2. For each valid row, check if anonymized_sample_id exists in DB
-     a. Not found            -> insert as version 1
-     b. Found, no changes    -> update last_modified only
-     c. Found, data changed  -> mark old row is_latest=False, insert new version
-                                capture which fields changed for the response
-  3. Bulk insert valid rows in a single transaction
-  4. Bulk insert rejected rows
-  5. Return counts + versioned diffs
+  2. Fetch all existing records for incoming IDs in one query
+  3. For each valid row:
+     a. Not found            -> INSERT new row
+     b. Found, no changes    -> update last_modified only (skip translation)
+     c. Found, data changed  -> UPDATE in place, update last_modified
+  4. Bulk insert new rows + rejected rows in one transaction
+  5. Return counts + IDs that need translation (inserted + updated only)
 """
 
 from datetime import datetime, timezone
@@ -22,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.rejected_row import RejectedRow
 from app.models.sample import Sample
-from app.schemas.sample import SampleRowIn, VersionedDiff, FieldChange
+from app.schemas.sample import SampleRowIn
 from app.core.logging import logger
 
 
@@ -31,11 +30,9 @@ def now_utc() -> datetime:
     return datetime.now(tz=timezone.utc).replace(microsecond=0)
 
 
-# Fields excluded from change-detection and diff reporting
-_IGNORED_IN_DIFF = {
-    "last_modified", "created_at", "is_latest", "version",
-    "id", "ingestion_log_id",
-    # File provenance — from source pipeline, not clinical data
+# Fields excluded from change detection
+_IGNORED_IN_COMPARE = {
+    "last_modified", "created_at", "id", "ingestion_log_id",
     "upload_date_time", "file_checksum", "file_size_bytes",
     "storage_name", "bucket_name", "checksum_algorithm",
 }
@@ -58,45 +55,42 @@ def _normalise(val: Any) -> Any:
     return val
 
 
-def _get_changed_fields(
-    existing: Sample,
-    incoming: SampleRowIn,
-) -> dict[str, FieldChange]:
+def _has_changed(existing: Sample, incoming: SampleRowIn) -> bool:
     """
-    Returns a dict of field name -> FieldChange for every field that differs.
-    Empty dict means no changes detected.
+    Returns True if any clinical data field differs between
+    the existing DB row and the incoming validated row.
     """
-    changed: dict[str, FieldChange] = {}
     incoming_dict = incoming.model_dump(by_alias=False)
-
     for field, new_val in incoming_dict.items():
-        if field in _IGNORED_IN_DIFF:
+        if field in _IGNORED_IN_COMPARE:
             continue
         db_val = getattr(existing, field, None)
-
-        norm_db  = _normalise(db_val)
-        norm_new = _normalise(new_val)
-
-        if norm_db != norm_new:
-            changed[field] = FieldChange(
-                from_value=norm_db,
-                to_value=norm_new,
-            )
-
-    return changed
+        if _normalise(db_val) != _normalise(new_val):
+            logger.debug(f"Field '{field}' changed: {_normalise(db_val)!r} -> {_normalise(new_val)!r}")
+            return True
+    return False
 
 
-def _sample_from_schema(row: SampleRowIn, version: int, log_id: int) -> Sample:
-    """Build a Sample ORM object from a validated Pydantic row."""
+def _build_sample(row: SampleRowIn, log_id: int) -> Sample:
+    """Build a new Sample ORM object from a validated Pydantic row."""
     data = row.model_dump(by_alias=False, exclude={"extra_fields"})
     return Sample(
         **data,
-        version=version,
-        is_latest=True,
         last_modified=now_utc(),
         ingestion_log_id=log_id,
         extra_fields=row.extra_fields,
     )
+
+
+def _update_values(row: SampleRowIn, log_id: int) -> dict[str, Any]:
+    """Build the dict of values for an UPDATE statement."""
+    data = row.model_dump(by_alias=False, exclude={"extra_fields"})
+    return {
+        **data,
+        "extra_fields": row.extra_fields,
+        "last_modified": now_utc(),
+        "ingestion_log_id": log_id,
+    }
 
 
 async def ingest_rows(
@@ -105,8 +99,13 @@ async def ingest_rows(
     ingestion_log_id: int,
 ) -> dict[str, Any]:
     """
-    Main ingestion function. Validates, deduplicates, and persists rows.
-    Returns counts dict with inserted, updated, versioned, rejected, versioned_diffs.
+    Main ingestion function. Validates, deduplicates, persists rows.
+
+    Returns:
+        counts:              inserted, updated, unchanged, rejected
+        inserted_ids:        anonymized_sample_ids of new rows (need translation)
+        updated_ids:         anonymized_sample_ids of changed rows (need retranslation)
+        unchanged_ids:       anonymized_sample_ids of complete duplicates (skip translation)
     """
     now = now_utc()
 
@@ -137,7 +136,7 @@ async def ingest_rows(
             logger.warning(f"Row {i} rejected: {reason}")
 
     # ------------------------------------------------------------------ #
-    # Step 2 — Fetch all existing latest records in one query
+    # Step 2 — Fetch all existing records for incoming IDs in one query
     # ------------------------------------------------------------------ #
     incoming_ids = [r.anonymized_sample_id for r in valid_rows]
     existing_map: dict[str, Sample] = {}
@@ -145,22 +144,24 @@ async def ingest_rows(
     if incoming_ids:
         result = await db.execute(
             select(Sample).where(
-                Sample.anonymized_sample_id.in_(incoming_ids),
-                Sample.is_latest.is_(True),
+                Sample.anonymized_sample_id.in_(incoming_ids)
             )
         )
         for sample in result.scalars().all():
             existing_map[sample.anonymized_sample_id] = sample
 
     # ------------------------------------------------------------------ #
-    # Step 3 — Classify each valid row: insert / update / version
+    # Step 3 — Classify and process each valid row
     # ------------------------------------------------------------------ #
     to_insert: list[Sample] = []
-    versioned_diffs: list[VersionedDiff] = []
+    inserted_ids: list[str] = []
+    updated_ids: list[str] = []
+    unchanged_ids: list[str] = []
+
     counts = {
         "inserted": 0,
         "updated": 0,
-        "versioned": 0,
+        "unchanged": 0,
         "rejected": len(rejected_rows),
     }
 
@@ -169,50 +170,43 @@ async def ingest_rows(
         existing = existing_map.get(sid)
 
         if existing is None:
-            to_insert.append(_sample_from_schema(row, version=1, log_id=ingestion_log_id))
+            # New record — insert
+            to_insert.append(_build_sample(row, log_id=ingestion_log_id))
+            inserted_ids.append(sid)
             counts["inserted"] += 1
 
+        elif _has_changed(existing, row):
+            # Data changed — update in place
+            await db.execute(
+                update(Sample)
+                .where(Sample.anonymized_sample_id == sid)
+                .values(**_update_values(row, log_id=ingestion_log_id))
+            )
+            updated_ids.append(sid)
+            counts["updated"] += 1
+            logger.info(f"Updated '{sid}' — content changed")
+
         else:
-            changed_fields = _get_changed_fields(existing, row)
-
-            if not changed_fields:
-                # Complete duplicate — update last_modified only
-                await db.execute(
-                    update(Sample)
-                    .where(Sample.id == existing.id)
-                    .values(last_modified=now)
-                )
-                counts["updated"] += 1
-
-            else:
-                # Data changed — retire old row, insert new version
-                await db.execute(
-                    update(Sample)
-                    .where(Sample.id == existing.id)
-                    .values(is_latest=False)
-                )
-                new_version = existing.version + 1
-                to_insert.append(
-                    _sample_from_schema(row, version=new_version, log_id=ingestion_log_id)
-                )
-                versioned_diffs.append(VersionedDiff(
-                    anonymized_sample_id=sid,
-                    old_version=existing.version,
-                    new_version=new_version,
-                    fields_changed=changed_fields,
-                ))
-                logger.info(
-                    f"Versioned '{sid}': v{existing.version} -> v{new_version} "
-                    f"| changed: {list(changed_fields.keys())}"
-                )
-                counts["versioned"] += 1
+            # Complete duplicate — update last_modified only, skip translation
+            await db.execute(
+                update(Sample)
+                .where(Sample.anonymized_sample_id == sid)
+                .values(last_modified=now, ingestion_log_id=ingestion_log_id)
+            )
+            unchanged_ids.append(sid)
+            counts["unchanged"] += 1
 
     # ------------------------------------------------------------------ #
-    # Step 4 — Bulk insert
+    # Step 4 — Bulk insert new rows + rejected rows
     # ------------------------------------------------------------------ #
     if to_insert:
         db.add_all(to_insert)
     if rejected_rows:
         db.add_all(rejected_rows)
 
-    return {**counts, "versioned_diffs": versioned_diffs}
+    return {
+        **counts,
+        "inserted_ids": inserted_ids,
+        "updated_ids": updated_ids,
+        "unchanged_ids": unchanged_ids,
+    }

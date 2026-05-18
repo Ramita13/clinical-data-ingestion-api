@@ -75,10 +75,17 @@ def _extract_extra_fields(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str
     """
     Splits a row dict into known fields and unknown (extra) fields.
     Unknown fields are preserved in extra_fields — never dropped.
+    Empty string values in extra fields are treated as None and excluded
+    so they do not trigger false change detection on re-upload.
     """
     known = {k: v for k, v in row.items() if k in ALL_KNOWN_COLUMNS}
-    extra = {k: v for k, v in row.items() if k not in ALL_KNOWN_COLUMNS}
-    return known, extra or None
+    extra = {
+        k: v for k, v in row.items()
+        if k not in ALL_KNOWN_COLUMNS
+        and v is not None
+        and str(v).strip() not in ("", "nan")
+    }
+    return known, extra if extra else None
 
 
 async def parse_upload(

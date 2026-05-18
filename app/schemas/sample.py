@@ -177,8 +177,7 @@ class SampleRowIn(BaseModel):
             return v
         try:
             import pandas as pd
-            # Let pandas infer format — handles both DD/MM/YYYY and YYYY-MM-DD
-            return pd.to_datetime(v, infer_datetime_format=True).to_pydatetime()
+            return pd.to_datetime(v).to_pydatetime()
         except Exception:
             return None
 
@@ -217,35 +216,21 @@ class SampleRowIn(BaseModel):
 # Response schemas
 # ------------------------------------------------------------------ #
 
-class FieldChange(BaseModel):
-    from_value: Any
-    to_value: Any
-
-
-class VersionedDiff(BaseModel):
-    anonymized_sample_id: str
-    old_version: int
-    new_version: int
-    fields_changed: dict[str, FieldChange]
-
-
 class UploadSummary(BaseModel):
     file_name: str
     rows_total: int
     rows_inserted: int
     rows_updated: int
-    rows_versioned: int
+    rows_unchanged: int
     rows_rejected: int
     ingestion_log_id: int
     duplicate_file_warning: bool = False
     missing_expected_columns: list[str] = []
-    versioned_diffs: list[VersionedDiff] = []
+    translation_status: str = "queued"
 
 
 class SampleOut(BaseModel):
     id: int
-    version: int
-    is_latest: bool
     last_modified: datetime
     created_at: datetime
     anonymized_sample_id: str
