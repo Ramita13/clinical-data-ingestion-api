@@ -47,3 +47,6 @@ alembic/versions/*.pyc
 
 # Project-specific
 CLAUDE.md
+
+# Test reports — generated locally, not committed
+reports/
