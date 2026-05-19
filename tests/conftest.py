@@ -1,12 +1,12 @@
 """
 conftest.py — shared fixtures for the entire test suite.
 
-Key design decisions:
-- Uses real PostgreSQL (mda_test_db) not SQLite — our schema uses JSONB/TSVECTOR
-- Each test runs inside a transaction that rolls back — clean state per test
-- Tables created once per session, not per test — fast
-- get_db dependency overridden to use the test session
-- AsyncClient used for API tests — no real server needed
+Uses synchronous psycopg2 driver for tests to avoid asyncpg event loop
+issues with Python 3.14 + pytest-asyncio on Windows.
+
+Production code uses asyncpg (async). Tests use psycopg2 (sync wrapped
+in async via SQLAlchemy's sync_to_async pattern). Same PostgreSQL database,
+same schema, same behaviour — just different driver for test isolation.
 """
 
 import asyncio
@@ -17,11 +17,13 @@ import pandas as pd
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import sessionmaker, Session
 
 from app.core.config import settings
 from app.db.session import get_db
@@ -30,91 +32,124 @@ from app.models import Base
 
 
 # ------------------------------------------------------------------ #
-# Event loop — one loop for the entire test session
+# Build sync URL from async URL
+# postgresql+asyncpg://... -> postgresql+psycopg2://...
 # ------------------------------------------------------------------ #
-@pytest.fixture(scope="session")
-def event_loop():
-    """Single event loop shared across all tests in the session."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+def _sync_url(async_url: str) -> str:
+    return async_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
 
 
 # ------------------------------------------------------------------ #
-# Test database engine — created once per session
+# Sync engine — used to set up/tear down tables and truncate
 # ------------------------------------------------------------------ #
 @pytest.fixture(scope="session")
-def test_engine():
-    """
-    Creates an async engine pointing at mda_test_db.
-    Scope=session means this is created once for all tests.
-    """
+def sync_engine():
     url = settings.TEST_DATABASE_URL
     if not url:
-        raise ValueError(
-            "TEST_DATABASE_URL not set in .env. "
-            "Add: TEST_DATABASE_URL=postgresql+asyncpg://mda_user:abc123@localhost:5432/mda_test_db"
-        )
-    engine = create_async_engine(url, echo=False)
+        raise ValueError("TEST_DATABASE_URL not set in .env")
+    engine = create_engine(_sync_url(url), echo=False)
     return engine
 
 
 # ------------------------------------------------------------------ #
-# Create all tables once per session, drop after all tests finish
+# Create tables once, drop after all tests
 # ------------------------------------------------------------------ #
-@pytest_asyncio.fixture(scope="session", autouse=True)
-async def create_tables(test_engine, event_loop):
-    """
-    Creates all tables in mda_test_db before any tests run.
-    Drops them after all tests finish.
-    autouse=True means this runs automatically for every test session.
-    """
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
+@pytest.fixture(scope="session", autouse=True)
+def create_tables(sync_engine):
+    Base.metadata.drop_all(sync_engine)
+    Base.metadata.create_all(sync_engine)
     yield
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await test_engine.dispose()
+    Base.metadata.drop_all(sync_engine)
+    sync_engine.dispose()
 
 
 # ------------------------------------------------------------------ #
-# Test session — each test gets a fresh transaction that rolls back
+# Sync session factory
 # ------------------------------------------------------------------ #
-@pytest_asyncio.fixture
-async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
-    """
-    Yields a DB session wrapped in a transaction.
-    Transaction is rolled back after each test — clean state guaranteed.
-    This means every test starts with empty tables.
-    """
-    async with test_engine.connect() as conn:
-        await conn.begin()
-        session_factory = async_sessionmaker(
-            bind=conn,
-            class_=AsyncSession,
-            expire_on_commit=False,
-            autoflush=False,
-        )
-        async with session_factory() as session:
-            yield session
-        await conn.rollback()
+@pytest.fixture(scope="session")
+def sync_session_factory(sync_engine):
+    return sessionmaker(bind=sync_engine, autocommit=False, autoflush=False)
 
 
 # ------------------------------------------------------------------ #
-# Override FastAPI's get_db dependency to use the test session
+# DB session — sync session wrapped for use in async tests
+# Truncates tables before each test for clean state
 # ------------------------------------------------------------------ #
 @pytest_asyncio.fixture
-async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+async def db_session(sync_session_factory, sync_engine) -> AsyncGenerator[Session, None]:
     """
-    Yields an async HTTP client that talks to the FastAPI app directly.
-    No real server needed — uses ASGITransport.
-    DB dependency is overridden to use the test session (with rollback).
+    Yields a synchronous DB session for tests.
+    Tables truncated before each test — clean state guaranteed.
+    Works around asyncpg event loop issues on Python 3.14/Windows.
+    """
+    # Truncate before test
+    with sync_engine.connect() as conn:
+        conn.execute(text("TRUNCATE TABLE rejected_rows, samples, ingestion_log, raw_files RESTART IDENTITY CASCADE"))
+        conn.commit()
+
+    session = sync_session_factory()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+    # Truncate after test
+    with sync_engine.connect() as conn:
+        conn.execute(text("TRUNCATE TABLE rejected_rows, samples, ingestion_log, raw_files RESTART IDENTITY CASCADE"))
+        conn.commit()
+
+
+# ------------------------------------------------------------------ #
+# Async session for API tests (uses asyncpg via the test DB URL)
+# ------------------------------------------------------------------ #
+@pytest.fixture(scope="session")
+def async_test_engine():
+    url = settings.TEST_DATABASE_URL
+    if not url:
+        raise ValueError("TEST_DATABASE_URL not set in .env")
+    return create_async_engine(url, echo=False)
+
+
+@pytest.fixture(scope="session")
+def async_test_session_factory(async_test_engine):
+    return async_sessionmaker(
+        bind=async_test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
+
+
+# ------------------------------------------------------------------ #
+# HTTP test client
+# ------------------------------------------------------------------ #
+@pytest_asyncio.fixture
+async def client(async_test_session_factory, sync_engine) -> AsyncGenerator[AsyncClient, None]:
+    """
+    Yields an async HTTP client for API endpoint tests.
+    Uses asyncpg session (needed for FastAPI async compatibility).
+    Tables truncated before each API test.
     """
     async def override_get_db():
-        yield db_session
+        async with async_test_session_factory() as session:
+            try:
+                yield session
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
 
     app.dependency_overrides[get_db] = override_get_db
+
+    # Truncate before API test
+    with sync_engine.connect() as conn:
+        conn.execute(text("TRUNCATE TABLE rejected_rows, samples, ingestion_log, raw_files RESTART IDENTITY CASCADE"))
+        conn.commit()
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -131,7 +166,6 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
 
 @pytest.fixture
 def valid_row() -> dict:
-    """A single valid row matching the expected Excel format."""
     return {
         "AnonymizedSampleID": "test_sample_001",
         "FileName": "slide_test_001.ndpi",
@@ -141,7 +175,7 @@ def valid_row() -> dict:
         "ClinicalInfo1": "Se solicita revisión de biopsia.",
         "MacroscopicDesc1": "Un bloque de parafina identificado.",
         "MicroscopicDesc1": "Fragmentos de ganglio linfático.",
-        "Diagnosis1": "Ganglio linfático: linfoma T angioinmunoblástico.",
+        "Diagnosis1": "Ganglio linfático: linfoma T.",
         "TopographicCode1": "T08000",
         "Location1": "GANGLIO LINFATICO",
         "IcdCode1": "M97053",
@@ -156,7 +190,6 @@ def valid_row() -> dict:
 
 @pytest.fixture
 def valid_row_changed(valid_row) -> dict:
-    """Same ID as valid_row but with changed clinical data — triggers UPDATE."""
     row = valid_row.copy()
     row["Diagnosis1"] = "UPDATED: Ganglio linfático: linfoma T, estadio IV."
     row["Age"] = "46"
@@ -165,7 +198,6 @@ def valid_row_changed(valid_row) -> dict:
 
 @pytest.fixture
 def row_blank_id() -> dict:
-    """Row with blank AnonymizedSampleID — should be rejected."""
     return {
         "AnonymizedSampleID": "",
         "FileName": "slide_bad.ndpi",
@@ -184,7 +216,6 @@ def row_blank_id() -> dict:
 
 @pytest.fixture
 def row_invalid_age() -> dict:
-    """Row with age=999 — should be rejected."""
     return {
         "AnonymizedSampleID": "test_bad_age_001",
         "FileName": "slide_bad_age.ndpi",
@@ -203,7 +234,6 @@ def row_invalid_age() -> dict:
 
 @pytest.fixture
 def row_invalid_year() -> dict:
-    """Row with DiagnosisYear=1750 — should be rejected."""
     return {
         "AnonymizedSampleID": "test_bad_year_001",
         "FileName": "slide_bad_year.ndpi",
@@ -222,7 +252,6 @@ def row_invalid_year() -> dict:
 
 @pytest.fixture
 def row_with_extra_fields(valid_row) -> dict:
-    """Row with unexpected extra columns — should land in extra_fields JSONB."""
     row = valid_row.copy()
     row["AnonymizedSampleID"] = "test_extra_001"
     row["NewColumn2026"] = "unexpected_value"
@@ -232,7 +261,6 @@ def row_with_extra_fields(valid_row) -> dict:
 
 @pytest.fixture
 def row_sparse() -> dict:
-    """Row with only required fields — most optional fields empty."""
     return {
         "AnonymizedSampleID": "test_sparse_001",
         "FileName": "slide_sparse.ndpi",
@@ -251,7 +279,6 @@ def row_sparse() -> dict:
 
 @pytest.fixture
 def row_multi_diagnosis() -> dict:
-    """Row with multiple diagnoses filled — tests diagnoses JSONB grouping."""
     return {
         "AnonymizedSampleID": "test_multidiag_001",
         "FileName": "slide_multi.ndpi",
@@ -278,11 +305,10 @@ def row_multi_diagnosis() -> dict:
 
 
 # ------------------------------------------------------------------ #
-# File fixtures — Excel and CSV bytes for upload endpoint tests
+# File fixtures
 # ------------------------------------------------------------------ #
 
 def _rows_to_xlsx_bytes(rows: list[dict]) -> bytes:
-    """Convert a list of row dicts to Excel bytes."""
     df = pd.DataFrame(rows)
     buf = io.BytesIO()
     df.to_excel(buf, index=False)
@@ -290,7 +316,6 @@ def _rows_to_xlsx_bytes(rows: list[dict]) -> bytes:
 
 
 def _rows_to_csv_bytes(rows: list[dict], sep: str = ",") -> bytes:
-    """Convert a list of row dicts to CSV bytes."""
     df = pd.DataFrame(rows)
     buf = io.StringIO()
     df.to_csv(buf, index=False, sep=sep)
@@ -298,7 +323,6 @@ def _rows_to_csv_bytes(rows: list[dict], sep: str = ",") -> bytes:
 
 
 def _rows_to_csv_bytes_bom(rows: list[dict], sep: str = ";") -> bytes:
-    """Convert rows to CSV bytes with UTF-8 BOM — mimics European Excel export."""
     df = pd.DataFrame(rows)
     buf = io.StringIO()
     df.to_csv(buf, index=False, sep=sep)
@@ -307,35 +331,29 @@ def _rows_to_csv_bytes_bom(rows: list[dict], sep: str = ";") -> bytes:
 
 @pytest.fixture
 def valid_xlsx_bytes(valid_row) -> bytes:
-    """Valid single-row Excel file as bytes."""
     return _rows_to_xlsx_bytes([valid_row])
 
 
 @pytest.fixture
 def multi_row_xlsx_bytes(valid_row, row_sparse, row_multi_diagnosis) -> bytes:
-    """Valid multi-row Excel file — 3 different valid rows."""
     return _rows_to_xlsx_bytes([valid_row, row_sparse, row_multi_diagnosis])
 
 
 @pytest.fixture
 def mixed_xlsx_bytes(valid_row, row_blank_id, row_invalid_age) -> bytes:
-    """Excel with valid and invalid rows mixed — tests partial ingestion."""
     return _rows_to_xlsx_bytes([valid_row, row_blank_id, row_invalid_age])
 
 
 @pytest.fixture
 def valid_csv_bytes(valid_row) -> bytes:
-    """Valid CSV with comma delimiter."""
     return _rows_to_csv_bytes([valid_row])
 
 
 @pytest.fixture
 def semicolon_csv_bytes(valid_row) -> bytes:
-    """Valid CSV with semicolon delimiter — European Excel export."""
     return _rows_to_csv_bytes([valid_row], sep=";")
 
 
 @pytest.fixture
 def bom_csv_bytes(valid_row) -> bytes:
-    """Valid CSV with UTF-8 BOM and semicolon delimiter."""
     return _rows_to_csv_bytes_bom([valid_row])

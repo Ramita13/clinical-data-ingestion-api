@@ -177,7 +177,7 @@ class SampleRowIn(BaseModel):
             return v
         try:
             import pandas as pd
-            return pd.to_datetime(v).to_pydatetime()
+            return pd.to_datetime(v, dayfirst=False, format="mixed").to_pydatetime()
         except Exception:
             return None
 
