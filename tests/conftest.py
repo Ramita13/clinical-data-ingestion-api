@@ -104,38 +104,27 @@ async def db_session(sync_session_factory, sync_engine) -> AsyncGenerator[Sessio
 
 
 # ------------------------------------------------------------------ #
-# Async session for API tests (uses asyncpg via the test DB URL)
+# HTTP test client — fresh async engine per test avoids asyncpg loop issues
 # ------------------------------------------------------------------ #
-@pytest.fixture(scope="session")
-def async_test_engine():
-    url = settings.TEST_DATABASE_URL
-    if not url:
-        raise ValueError("TEST_DATABASE_URL not set in .env")
-    return create_async_engine(url, echo=False)
-
-
-@pytest.fixture(scope="session")
-def async_test_session_factory(async_test_engine):
-    return async_sessionmaker(
-        bind=async_test_engine,
+@pytest_asyncio.fixture
+async def client(sync_engine) -> AsyncGenerator[AsyncClient, None]:
+    """
+    Yields an async HTTP client for API endpoint tests.
+    Creates a fresh async engine per test — avoids asyncpg event loop
+    conflicts on Python 3.14/Windows.
+    Tables truncated before each API test via sync engine.
+    """
+    # Fresh engine bound to current test event loop
+    engine = create_async_engine(settings.TEST_DATABASE_URL, echo=False)
+    factory = async_sessionmaker(
+        bind=engine,
         class_=AsyncSession,
         expire_on_commit=False,
         autoflush=False,
     )
 
-
-# ------------------------------------------------------------------ #
-# HTTP test client
-# ------------------------------------------------------------------ #
-@pytest_asyncio.fixture
-async def client(async_test_session_factory, sync_engine) -> AsyncGenerator[AsyncClient, None]:
-    """
-    Yields an async HTTP client for API endpoint tests.
-    Uses asyncpg session (needed for FastAPI async compatibility).
-    Tables truncated before each API test.
-    """
     async def override_get_db():
-        async with async_test_session_factory() as session:
+        async with factory() as session:
             try:
                 yield session
             except Exception:
@@ -146,7 +135,7 @@ async def client(async_test_session_factory, sync_engine) -> AsyncGenerator[Asyn
 
     app.dependency_overrides[get_db] = override_get_db
 
-    # Truncate before API test
+    # Truncate before API test using sync engine
     with sync_engine.connect() as conn:
         conn.execute(text("TRUNCATE TABLE rejected_rows, samples, ingestion_log, raw_files RESTART IDENTITY CASCADE"))
         conn.commit()
@@ -158,6 +147,10 @@ async def client(async_test_session_factory, sync_engine) -> AsyncGenerator[Asyn
         yield ac
 
     app.dependency_overrides.clear()
+    try:
+        await engine.dispose()
+    except Exception:
+        pass  # Suppress asyncpg teardown errors on Python 3.14/Windows
 
 
 # ------------------------------------------------------------------ #

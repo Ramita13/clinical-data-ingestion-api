@@ -6,3 +6,8 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 log_cli = true
 log_cli_level = "WARNING"
+log_cli_format = "%(levelname)-8s %(name)s:%(filename)s:%(lineno)d %(message)s"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
