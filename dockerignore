@@ -1,0 +1,38 @@
+# Virtual environment — never copy into Docker image
+venv/
+env/
+.venv/
+
+# Environment files — Docker uses environment: in compose instead
+.env
+.env.local
+
+# Test files — not needed in production image
+tests/
+reports/
+pytest.ini
+pyproject.toml
+
+# Git
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data files — never commit patient data
+*.xlsx
+*.csv
+*.xls
+
+# Project notes
+CLAUDE.md
+FULL_SESSION_SUMMARY.md
+TRANSLATION_DISCUSSION.md
+
+# IDE
+.vscode/
+.idea/

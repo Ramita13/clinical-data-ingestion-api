@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL database ──────────────────────────────────────────
+  db:
+    image: postgres:17-alpine
+    container_name: mda_postgres
+    environment:
+      POSTGRES_USER: mda_user
+      POSTGRES_PASSWORD: abc123
+      POSTGRES_DB: mda_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # data persists between restarts
+    ports:
+      - "5432:5432"                               # expose for pgAdmin access if needed
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mda_user -d mda_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI application ──────────────────────────────────────────
+  api:
+    build: .
+    container_name: mda_api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mda_user:abc123@db:5432/mda_db
+      DB_POOL_SIZE: 10
+      DB_MAX_OVERFLOW: 20
+      DB_POOL_TIMEOUT: 30
+      APP_ENV: production
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy   # waits for PostgreSQL to be ready before starting
+    restart: unless-stopped          # auto-restarts if it crashes
+
+volumes:
+  postgres_data:                     # named volume — data survives container restarts
