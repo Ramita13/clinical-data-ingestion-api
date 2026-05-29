@@ -15,7 +15,7 @@ from app.core.logging import logger
 
 router = APIRouter(prefix="/upload", tags=["ingestion"])
 
-MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB hard limit
+MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 50 MB hard limit
 
 
 @router.post(

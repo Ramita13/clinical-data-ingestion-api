@@ -10,6 +10,7 @@ import pandas as pd
 from app.schemas.sample import ALL_KNOWN_COLUMNS, COLUMN_ALIASES, CORE_COLUMNS, EXPECTED_COLUMNS
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+print("DEBUG: file_parser.py loaded — sep= fix active")
 
 
 class FileValidationError(Exception):
@@ -21,17 +22,34 @@ def _compute_checksum(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
+def _has_sep_directive(file_bytes: bytes) -> bool:
+    """
+    Returns True if the file starts with a sep= directive line.
+    Excel adds this when saving UTF-8 CSV with a non-comma delimiter.
+    Example first line: sep=;
+    """
+    first_line = file_bytes.decode("utf-8-sig").split("\n")[0].strip()
+    return first_line.lower().startswith("sep=")
+
+
 def _detect_csv_delimiter(file_bytes: bytes) -> str:
     """
-    Detect whether a CSV uses comma or semicolon as delimiter.
-    Reads the first line and counts which appears more — that's the delimiter.
-    Handles BOM (byte order mark) that Excel adds to UTF-8 CSV files.
+    Detect whether a CSV uses comma, semicolon, or tab as delimiter.
+    Reads the header line and counts which appears most.
+    Handles BOM and sep= directive lines added by Excel.
     """
-    # Decode first line, stripping BOM if present
-    first_line = file_bytes.decode("utf-8-sig").split("\n")[0]
-    comma_count = first_line.count(",")
-    semicolon_count = first_line.count(";")
-    return ";" if semicolon_count > comma_count else ","
+    lines = file_bytes.decode("utf-8-sig").split("\n")
+    # Skip sep= directive line if present — use the actual header line
+    header_line = lines[1] if lines[0].strip().lower().startswith("sep=") else lines[0]
+    comma_count = header_line.count(",")
+    semicolon_count = header_line.count(";")
+    tab_count = header_line.count("\t")
+    max_count = max(comma_count, semicolon_count, tab_count)
+    if tab_count == max_count and tab_count > 0:
+        return "\t"
+    if semicolon_count == max_count and semicolon_count > 0:
+        return ";"
+    return ","
 
 
 def _read_file_sync(file_bytes: bytes, extension: str) -> pd.DataFrame:
@@ -39,20 +57,27 @@ def _read_file_sync(file_bytes: bytes, extension: str) -> pd.DataFrame:
     Synchronous pandas read — runs in a thread pool via run_in_executor.
     Handles:
     - Excel (.xlsx, .xls)
-    - CSV with comma or semicolon delimiter
+    - CSV with comma, semicolon, or tab delimiter
     - BOM character added by Excel when saving as UTF-8 CSV
+    - sep= directive line added by Excel (e.g. sep=;)
     """
     buf = io.BytesIO(file_bytes)
     if extension == ".csv":
         delimiter = _detect_csv_delimiter(file_bytes)
+        skiprows = 1 if _has_sep_directive(file_bytes) else 0
+        print(f"DEBUG: delimiter={repr(delimiter)}, skiprows={skiprows}, first_line={repr(file_bytes.decode('utf-8-sig').split(chr(10))[0][:30])}")
         return pd.read_csv(
             buf,
             dtype=str,
             keep_default_na=False,
             sep=delimiter,
-            encoding="utf-8-sig",  # handles BOM automatically
+            encoding="utf-8-sig",
+            skiprows=skiprows,
         )
-    return pd.read_excel(buf, dtype=str, keep_default_na=False)
+    df = pd.read_excel(buf, dtype=str, keep_default_na=False)
+    # Strip BOM from column names — Excel sometimes adds \ufeff to the first column
+    df.columns = [c.lstrip('\ufeff') for c in df.columns]
+    return df
 
 
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:

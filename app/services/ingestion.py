@@ -141,14 +141,19 @@ async def ingest_rows(
     incoming_ids = [r.anonymized_sample_id for r in valid_rows]
     existing_map: dict[str, Sample] = {}
 
+    # Fetch existing records in chunks to avoid PostgreSQL parameter limit
+    # IN clause with thousands of IDs hits the 65,535 parameter limit
+    ID_CHUNK_SIZE = 1000
     if incoming_ids:
-        result = await db.execute(
-            select(Sample).where(
-                Sample.anonymized_sample_id.in_(incoming_ids)
+        for i in range(0, len(incoming_ids), ID_CHUNK_SIZE):
+            id_chunk = incoming_ids[i:i + ID_CHUNK_SIZE]
+            result = await db.execute(
+                select(Sample).where(
+                    Sample.anonymized_sample_id.in_(id_chunk)
+                )
             )
-        )
-        for sample in result.scalars().all():
-            existing_map[sample.anonymized_sample_id] = sample
+            for sample in result.scalars().all():
+                existing_map[sample.anonymized_sample_id] = sample
 
     # ------------------------------------------------------------------ #
     # Step 3 — Classify and process each valid row
@@ -197,12 +202,24 @@ async def ingest_rows(
             counts["unchanged"] += 1
 
     # ------------------------------------------------------------------ #
-    # Step 4 — Bulk insert new rows + rejected rows
+    # Step 4 — Bulk insert new rows + rejected rows in chunks
+    # PostgreSQL has a hard limit of 65,535 parameters per query.
+    # Each row has ~22 columns so max safe batch = 500 rows (500 * 22 = 11,000 params).
     # ------------------------------------------------------------------ #
+    BATCH_SIZE = 500
+
     if to_insert:
-        db.add_all(to_insert)
+        for i in range(0, len(to_insert), BATCH_SIZE):
+            chunk = to_insert[i:i + BATCH_SIZE]
+            db.add_all(chunk)
+            await db.flush()   # sends this chunk to DB, clears SQLAlchemy identity map
+            logger.info(f"Inserted batch {i // BATCH_SIZE + 1} of {-(-len(to_insert) // BATCH_SIZE)} ({len(chunk)} rows)")
+
     if rejected_rows:
-        db.add_all(rejected_rows)
+        for i in range(0, len(rejected_rows), BATCH_SIZE):
+            chunk = rejected_rows[i:i + BATCH_SIZE]
+            db.add_all(chunk)
+            await db.flush()
 
     return {
         **counts,

@@ -177,7 +177,11 @@ class SampleRowIn(BaseModel):
             return v
         try:
             import pandas as pd
-            return pd.to_datetime(v, dayfirst=False, format="mixed").to_pydatetime()
+            parsed = pd.to_datetime(v, dayfirst=False, format="mixed")
+            # Guard against NaT (pandas Not a Time — empty datetime cells)
+            if pd.isnull(parsed):
+                return None
+            return parsed.to_pydatetime()
         except Exception:
             return None
 
@@ -257,3 +261,10 @@ class SampleOut(BaseModel):
     extra_fields: dict | None
 
     model_config = {"from_attributes": True}
+
+
+class SampleListResponse(BaseModel):
+    """Paginated response for list and filter endpoints."""
+    total: int      # total records matching filter across all pages
+    count: int      # records returned in this response
+    records: list[SampleOut]
